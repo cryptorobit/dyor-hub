@@ -10,10 +10,11 @@ import { tokens } from '@/lib/api';
 import { isValidSolanaAddress, truncateAddress } from '@/lib/utils';
 import type { TokenStats as TokenStatsType } from '@dyor-hub/types';
 import { Token, TwitterUsernameHistoryEntity } from '@dyor-hub/types';
-import { Globe, MessageSquare, Search, Shield, Sparkles, Twitter } from 'lucide-react';
+import { ChartArea, Globe, MessageSquare, Search, Shield, Sparkles, Twitter } from 'lucide-react';
 import Link from 'next/link';
 import { notFound, useRouter } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
+import ChartSection from '@/components/comments/ChartSection';
 
 interface PageProps {
   params: Promise<{ mintAddress: string }>;
@@ -381,6 +382,15 @@ export default function Page({ params }: PageProps) {
               <Card className='relative h-full bg-zinc-900/40 backdrop-blur-sm border-0 rounded-xl overflow-hidden'>
                 <div className='absolute inset-0 bg-gradient-to-br from-purple-600/5 to-purple-800/5 opacity-0 group-hover:opacity-100 transition-opacity duration-300' />
                 <CardHeader className='pb-2 relative'>
+                  <div className='flex items-center'>
+                    <div className='h-10 w-10 rounded-xl bg-purple-500/10 flex items-center justify-center mr-4 group-hover:bg-purple-500/20 transition-colors duration-300'>
+                      <ChartArea className='h-5 w-5 text-purple-400' />
+                    </div>
+                    <CardTitle className='text-xl font-semibold text-white'>
+                      Chart
+                    </CardTitle>
+                  </div>
+                  <ChartSection tokenMintAddress={token.mintAddress} />
                   <div className='flex items-center'>
                     <div className='h-10 w-10 rounded-xl bg-purple-500/10 flex items-center justify-center mr-4 group-hover:bg-purple-500/20 transition-colors duration-300'>
                       <MessageSquare className='h-5 w-5 text-purple-400' />
