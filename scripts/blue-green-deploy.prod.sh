@@ -8,6 +8,7 @@ GREEN_PORT_WEB=3200
 BLUE_PORT_API=3101
 GREEN_PORT_API=3201
 NGINX_CONFIG="/etc/nginx/sites-enabled/dyor-hub"
+GITHUB_REPO="jcoulaud/dyor-hub"
 
 # Simple logging
 log() {
@@ -42,6 +43,30 @@ cleanup_docker_resources() {
   } &>/dev/null &  # Redirect all output to /dev/null and run in background
 }
 
+# Rollback function
+rollback() {
+  log "Starting rollback..."
+  
+  # Restore Nginx config
+  if [ -f "${NGINX_CONFIG}.bak" ]; then
+    sudo cp "${NGINX_CONFIG}.bak" $NGINX_CONFIG
+    sudo nginx -s reload -q
+  fi
+  
+  # Stop and remove new containers
+  for container in "dyor-hub-$NEW_ENV-web" "dyor-hub-$NEW_ENV-api"; do
+    if docker ps -a | grep -q "$container"; then
+      docker stop "$container" && docker rm "$container"
+    fi
+  done
+  
+  # Cleanup
+  rm -f docker-compose.override.yml
+  
+  log "Rollback completed"
+  exit 1
+}
+
 log "Starting blue-green deployment"
 
 # Determine current active environment
@@ -63,6 +88,19 @@ fi
 
 log "Current: $CURRENT_ENV, New: $NEW_ENV"
 
+# Migration step: Check and stop old service names if they exist
+log "Checking for old service names"
+if docker ps -a | grep -q "dyor-hub-api" || docker ps -a | grep -q "dyor-hub-web"; then
+  log "Found old service names, stopping them..."
+  docker-compose down api web || true
+  for container in "dyor-hub-api" "dyor-hub-web"; do
+    if docker ps -a | grep -q "$container"; then
+      docker stop "$container" && docker rm "$container"
+    fi
+  done
+  log "Old services stopped"
+fi
+
 # Backup and update code
 cd $APP_DIR
 mkdir -p /tmp/dyor-hub-backup/{apps/api,apps/web}
@@ -83,84 +121,41 @@ fi
 cat > docker-compose.override.yml << EOF
 version: '3.8'
 services:
-  postgres:
-    container_name: dyor-hub-postgres
-    env_file:
-      - ./apps/api/.env
-    restart: always
-  api:
+  ${NEW_ENV}-api:
+    image: ghcr.io/$GITHUB_REPO/api:latest
     container_name: dyor-hub-$NEW_ENV-api
     ports: ['127.0.0.1:$NEW_PORT_API:3001']
-    environment:
-      - DATABASE_HOST=postgres
-      - REDIS_HOST=redis
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-  web:
+  ${NEW_ENV}-web:
+    image: ghcr.io/$GITHUB_REPO/web:latest
     container_name: dyor-hub-$NEW_ENV-web
     ports: ['127.0.0.1:$NEW_PORT_WEB:3000']
     depends_on:
-      api:
+      ${NEW_ENV}-api:
         condition: service_started
 EOF
 
-# Build and start new environment
-log "Building $NEW_ENV environment"
-# Use buildkit for optimization
-export DOCKER_BUILDKIT=1
-export COMPOSE_DOCKER_CLI_BUILD=1
+# Pull latest images
+log "Pulling latest images"
+docker-compose pull ${NEW_ENV}-api ${NEW_ENV}-web || {
+  log "ERROR: Failed to pull images"
+  rollback
+}
 
-# Check for changes that would require a rebuild
-CHANGES_DETECTED=false
-if [ "$FORCE_REBUILD" = "true" ]; then
-  CHANGES_DETECTED=true
-  log "Force rebuild requested"
-else
-  # Get the current and previous commit hashes
-  CURRENT_COMMIT=$(git rev-parse HEAD)
-  
-  # Check if .env.last-deployed-commit exists
-  if [ -f ".env.last-deployed-commit" ]; then
-    LAST_DEPLOYED_COMMIT=$(cat .env.last-deployed-commit)
-    
-    if [ "$CURRENT_COMMIT" != "$LAST_DEPLOYED_COMMIT" ]; then
-      CHANGES_DETECTED=true
-      log "New commit detected: $CURRENT_COMMIT (previous: $LAST_DEPLOYED_COMMIT)"
-    else
-      log "No new commits detected"
-    fi
-  else
-    # First deployment or file doesn't exist
-    CHANGES_DETECTED=true
-    log "First deployment or missing commit tracking file"
-  fi
-fi
-
-# Only build images if changes detected or images don't exist
-if [ "$CHANGES_DETECTED" = "true" ] || ! docker image inspect dyor-hub-api:latest >/dev/null 2>&1 || ! docker image inspect dyor-hub-web:latest >/dev/null 2>&1; then
-  log "Building Docker images with cache optimizations"
-  # Clean up old images to ensure we get a fresh build
-  docker-compose build --no-cache --build-arg BUILDKIT_INLINE_CACHE=1
-  
-  # Save the current commit as the last deployed
-  echo "$CURRENT_COMMIT" > .env.last-deployed-commit
-  log "Docker images rebuilt successfully"
-else
-  log "Skipping image build, using existing images"
-fi
-
-log "Starting database services"
-docker-compose up -d postgres redis
-sleep 10
-log "Starting $NEW_ENV services"
-docker-compose up -d api web
+# Start new environment
+log "Starting $NEW_ENV environment"
+docker-compose up -d ${NEW_ENV}-api ${NEW_ENV}-web || {
+  log "ERROR: Failed to start new environment"
+  rollback
+}
 
 # Wait for API service to become ready
 log "Waiting for API service to become ready"
-MAX_RETRIES=60
+MAX_RETRIES=10
 RETRY_COUNT=0
 until curl -s "http://127.0.0.1:$NEW_PORT_API/health" | grep -q "ok" || [ $RETRY_COUNT -eq $MAX_RETRIES ]; do
   log "Waiting for API to be available... $(( RETRY_COUNT + 1 ))/$MAX_RETRIES"
@@ -169,14 +164,28 @@ until curl -s "http://127.0.0.1:$NEW_PORT_API/health" | grep -q "ok" || [ $RETRY
 done
 
 if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
-  log "WARNING: API health check timed out, proceeding anyway"
-else
-  log "API service is ready"
+  log "ERROR: API health check failed"
+  rollback
 fi
 
-# Wait for services to start
-log "Waiting for all services to become ready"
-sleep 10
+log "API service is healthy"
+
+# Wait for web service to become ready
+log "Waiting for Web service to become ready"
+MAX_RETRIES=10
+RETRY_COUNT=0
+until curl -s "http://127.0.0.1:$NEW_PORT_WEB" > /dev/null || [ $RETRY_COUNT -eq $MAX_RETRIES ]; do
+  log "Waiting for Web to be available... $(( RETRY_COUNT + 1 ))/$MAX_RETRIES"
+  sleep 2
+  RETRY_COUNT=$((RETRY_COUNT + 1))
+done
+
+if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+  log "ERROR: Web health check failed"
+  rollback
+fi
+
+log "Web service is healthy"
 
 # Switch traffic
 log "Updating Nginx to point to $NEW_ENV environment"
@@ -184,33 +193,27 @@ sudo cp $NGINX_CONFIG "${NGINX_CONFIG}.bak"
 sudo sed -i "s|http://127.0.0.1:$CURRENT_PORT_WEB|http://127.0.0.1:$NEW_PORT_WEB|g" $NGINX_CONFIG
 sudo sed -i "s|http://127.0.0.1:$CURRENT_PORT_API|http://127.0.0.1:$NEW_PORT_API|g" $NGINX_CONFIG
 
-# Test Nginx configuration quietly
-log "Testing and reloading Nginx configuration"
-sudo nginx -t -q
-if [ $? -eq 0 ]; then
-  sudo nginx -s reload -q
-  log "Nginx configuration updated successfully"
-  
-  # Only run immediate cleanup if API check was successful (not timed out)
-  if [ $RETRY_COUNT -ne $MAX_RETRIES ]; then
-    log "Running immediate Docker builder cleanup"
-    docker builder prune -f
-    log "Docker builder cleanup completed"
-  else
-    log "Skipping immediate Docker builder cleanup as API health check timed out"
-  fi
-else
-  log "ERROR: Nginx configuration test failed. Rolling back..."
-  sudo cp "${NGINX_CONFIG}.bak" $NGINX_CONFIG
-  exit 1
+# Test Nginx configuration
+log "Testing Nginx configuration"
+if ! sudo nginx -t -q; then
+  log "ERROR: Nginx configuration test failed"
+  rollback
 fi
+
+# Reload Nginx
+log "Reloading Nginx"
+sudo nginx -s reload -q
 
 # Wait for connections to drain
 log "Waiting for connections to drain from old environment"
 sleep 30
 
-# Stop old environment - first check if containers exist
+# Stop old environment
 log "Stopping old $CURRENT_ENV environment"
+# Stop and remove old services
+docker-compose down ${CURRENT_ENV}-api ${CURRENT_ENV}-web
+
+# Then stop and remove old containers (in case they weren't managed by compose)
 for container in "dyor-hub-$CURRENT_ENV-web" "dyor-hub-$CURRENT_ENV-api"; do
   if docker ps -a | grep -q "$container"; then
     docker stop "$container" && docker rm "$container"
@@ -219,9 +222,9 @@ done
 
 # Cleanup
 docker image prune -f
-rm docker-compose.override.yml
+rm -f docker-compose.override.yml
 echo "$NEW_ENV" > ".env.active"
 
 log "Deployment completed successfully"
-cleanup_docker_resources  # Start cleanup in background
+cleanup_docker_resources
 log "Deployment finished, cleanup will run in background" 

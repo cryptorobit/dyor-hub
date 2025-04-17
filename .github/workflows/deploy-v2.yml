@@ -1,9 +1,8 @@
-name: Deploy to Production
+name: Deploy to Production v2 (Blue/Green)
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
     inputs:
       force_rebuild:
@@ -13,64 +12,152 @@ on:
         type: boolean
 
 jobs:
-  build-and-deploy:
-    if: true # Disable this workflow
+  build-types:
+    if: false # Disable this workflow
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build types
+        run: cd packages/types && pnpm run build
+
+      - name: Upload types artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: types-dist
+          path: packages/types/dist
+          retention-days: 1
+
+  build-apps:
+    needs: build-types
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: [api, web]
+      fail-fast: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            apps/${{ matrix.app }}
+            packages/types
+            pnpm-lock.yaml
+            pnpm-workspace.yaml
+            package.json
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Cache dist and next folders
+        uses: actions/cache@v4
+        with:
+          path: |
+            apps/${{ matrix.app }}/dist
+            apps/${{ matrix.app }}/.next
+          key: ${{ runner.os }}-${{ matrix.app }}-build-${{ hashFiles('apps/${{ matrix.app }}/**/*') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.app }}-build-
+
+      - name: Download types artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: types-dist
+          path: packages/types/dist
+
+      - name: Build app
+        run: cd apps/${{ matrix.app }} && pnpm run build
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:master
+            network=host
+          platforms: linux/amd64,linux/arm64
+          install: true
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push apps
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./apps/${{ matrix.app }}/Dockerfile.prod
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ github.repository }}/${{ matrix.app }}:latest
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+            NODE_ENV=production
+            BUILDKIT_SANDBOX_HOSTNAME=buildkitd
+            APP_BUILD_DIR=${{ matrix.app == 'web' && '.next' || 'dist' }}
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository }}/${{ matrix.app }}:buildcache
+            type=gha
+            type=local,src=/tmp/.buildx-cache
+            type=gha,scope=${{ github.ref }}-${{ matrix.app }}
+            type=gha,scope=${{ github.ref }}
+            type=gha,scope=global
+          cache-to: |
+            type=registry,ref=ghcr.io/${{ github.repository }}/${{ matrix.app }}:buildcache,mode=max
+            type=gha,mode=max
+            type=local,dest=/tmp/.buildx-cache-new
+            type=gha,mode=max,scope=${{ github.ref }}-${{ matrix.app }}
+            type=gha,mode=max,scope=${{ github.ref }}
+            type=gha,mode=max,scope=global
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  deploy:
+    needs: build-apps
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: latest
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'pnpm'
-
-      - name: Cache pnpm store
-        uses: actions/cache@v4
-        with:
-          path: ~/.local/share/pnpm/store
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-store-
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Cache build artifacts
-        id: cache-build
-        uses: actions/cache@v4
-        with:
-          path: |
-            packages/types/dist
-            apps/api/dist
-            apps/web/.next
-            apps/web/dist
-          key: ${{ runner.os }}-build-${{ github.sha }}-${{ hashFiles('**/pnpm-lock.yaml', 'packages/types/src/**', 'apps/api/src/**', 'apps/web/src/**', 'apps/web/app/**') }}
-          restore-keys: |
-            ${{ runner.os }}-build-
-
-      - name: Build packages
-        if: steps.cache-build.outputs.cache-hit != 'true'
-        run: |
-          cd packages/types
-          pnpm build
-
-      - name: Build API and Web in parallel
-        if: steps.cache-build.outputs.cache-hit != 'true'
-        run: |
-          pnpm --filter "@dyor-hub/api" build &
-          pnpm --filter "@dyor-hub/web" build &
-          wait
 
       - name: Setup SSH
         uses: webfactory/ssh-agent@v0.9.0
@@ -87,44 +174,7 @@ jobs:
           DROPLET_IP: ${{ secrets.DROPLET_IP }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          scp scripts/blue-green-deploy.sh $DEPLOY_USER@$DROPLET_IP:/tmp/blue-green-deploy.sh
-
-      - name: Smart Cleanup
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.DROPLET_IP }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          port: 22
-          script: |
-            echo "=== Smart cleanup to prevent disk bloat ==="
-
-            # Remove stopped containers older than 24h
-            docker container prune -f --filter "until=24h"
-
-            # Remove dangling images (not used by any container)
-            docker image prune -f
-
-            # Remove unused volumes older than 7 days
-            docker volume prune -f --filter "until=168h"
-
-            # Clean old log files
-            find /var/log -type f -name "*.gz" -delete 2>/dev/null || true
-
-            # Clean apt cache only if disk usage is above 80%
-            if [ $(df -h / | awk 'NR==2 {print $5}' | sed 's/%//') -gt 80 ]; then
-              apt-get clean -y 2>/dev/null || true
-            fi
-
-      - name: Verify Nginx Configuration
-        env:
-          DROPLET_IP: ${{ secrets.DROPLET_IP }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-        run: |
-          ssh $DEPLOY_USER@$DROPLET_IP "sudo test -f /etc/nginx/sites-enabled/dyor-hub && sudo nginx -t" || {
-            echo "Nginx configuration issue detected. Please check manually."
-            exit 1
-          }
+          scp scripts/blue-green-deploy.prod.sh $DEPLOY_USER@$DROPLET_IP:/tmp/blue-green-deploy.sh
 
       - name: Deploy to DigitalOcean
         env:
@@ -132,11 +182,9 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           APP_DIR: /var/www/dyor-hub
           GITHUB_REPO: ${{ github.repository }}
-          FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || 'true' }}
         run: |
-          echo "Starting blue-green deployment - Note: The site will remain available during deployment"
-          echo "This is a zero-downtime deployment, but you might temporarily see a 'Deploying' message"
-          ssh $DEPLOY_USER@$DROPLET_IP "chmod +x /tmp/blue-green-deploy.sh && sudo GITHUB_REPO=$GITHUB_REPO APP_DIR=$APP_DIR FORCE_REBUILD=$FORCE_REBUILD /tmp/blue-green-deploy.sh"
+          echo "Starting blue-green deployment"
+          ssh $DEPLOY_USER@$DROPLET_IP "chmod +x /tmp/blue-green-deploy.sh && sudo GITHUB_REPO=$GITHUB_REPO APP_DIR=$APP_DIR /tmp/blue-green-deploy.sh"
           echo "Deployment command executed successfully"
 
       - name: Wait for services to stabilize
@@ -149,7 +197,6 @@ jobs:
         env:
           DROPLET_IP: ${{ secrets.DROPLET_IP }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          APP_DIR: /var/www/dyor-hub
         run: |
           echo "Checking container status..."
           ssh $DEPLOY_USER@$DROPLET_IP "docker ps -a"
@@ -161,11 +208,6 @@ jobs:
           echo "Checking if containers are running..."
           if ! ssh $DEPLOY_USER@$DROPLET_IP "docker ps | grep 'dyor-hub-$ACTIVE_ENV'"; then
             echo "ERROR: No containers for the active environment ($ACTIVE_ENV) are running!"
-            
-            # Show logs briefly
-            ssh $DEPLOY_USER@$DROPLET_IP "docker logs --tail=20 dyor-hub-$ACTIVE_ENV-web 2>&1 || echo 'No web container logs available'"
-            ssh $DEPLOY_USER@$DROPLET_IP "docker logs --tail=20 dyor-hub-$ACTIVE_ENV-api 2>&1 || echo 'No API container logs available'"
-            
             exit 1
           fi
 
@@ -173,7 +215,6 @@ jobs:
           MAX_RETRIES=3
           RETRY_COUNT=0
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            # Try multiple health endpoints - the main website, API health, or a known page
             RESPONSE_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://dyorhub.xyz/ || echo "failed")
             echo "Website health check response: $RESPONSE_CODE"
             
@@ -197,8 +238,6 @@ jobs:
               sleep 5
             fi
           done
-
-          echo "Deployment verification successful!"
 
       - name: Post Deployment to Discord
         if: success()
